@@ -43,7 +43,7 @@ func ReadWorkspaceLogs(ctx context.Context, activeProfile config.Profile, worksp
 				}
 
 				ws, res, err := GetWebsocketConn(ctx, fmt.Sprintf("/log/workspace/%s/%s", workspaceId, projectName), &activeProfile, &query)
-				// We want to retry getting the logs if it fails
+				// We want to retry getting the logs if initial connection fails
 				if err != nil {
 					log.Trace(HandleErrorResponse(res, err))
 					time.Sleep(500 * time.Millisecond)
@@ -81,7 +81,6 @@ func ReadBuildLogs(ctx context.Context, activeProfile config.Profile, buildId st
 
 	for {
 		ws, res, err := GetWebsocketConn(ctx, fmt.Sprintf("/log/build/%s", buildId), &activeProfile, &query)
-		// We want to retry getting the logs if it fails
 		if err != nil {
 			log.Trace(HandleErrorResponse(res, err))
 			time.Sleep(250 * time.Millisecond)
@@ -103,18 +102,16 @@ func readJSONLog(ctx context.Context, ws *websocket.Conn, index int, from *time.
 
 			err := ws.ReadJSON(&logEntry)
 
-			// An empty entry will be sent from the server on close/EOF
-			// We don't want to print that
-			if logEntry != (logs.LogEntry{}) {
-				logEntriesChan <- logEntry
-			}
-
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure) {
 					log.Error(err)
 				}
 				readErr <- err
 				return
+			}
+
+			if logEntry != (logs.LogEntry{}) {
+				logEntriesChan <- logEntry
 			}
 		}
 	}()
@@ -136,15 +133,27 @@ func readJSONLog(ctx context.Context, ws *websocket.Conn, index int, from *time.
 			} else {
 				logs_view.DisplayLogEntry(logEntry, index)
 			}
-
 		case err := <-readErr:
 			if err != nil {
-				err := ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-				if err != nil {
-					log.Trace(err)
+				log.Warnf("Error occurred while reading logs: %v", err)
+				reconnectAttempts := 0
+				for {
+					reconnectAttempts++
+					log.Infof("Attempting to reconnect to websocket (attempt %d)...", reconnectAttempts)
+
+					newWs, res, err := GetWebsocketConn(ctx, ws.LocalAddr().String(), nil, nil)
+					if err != nil {
+						log.Warnf("Failed to reconnect: %v", err)
+						time.Sleep(1 * time.Second) // Wait before retrying
+						continue
+					}
+
+					ws = newWs
+					if res != nil {
+						res.Body.Close()
+					}
+					break
 				}
-				ws.Close()
-				return
 			}
 		}
 
