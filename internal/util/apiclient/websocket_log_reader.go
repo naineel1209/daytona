@@ -51,7 +51,6 @@ func ReadWorkspaceLogs(ctx context.Context, activeProfile config.Profile, worksp
 				}
 
 				readJSONLog(ctx, ws, index, from)
-				ws.Close()
 				break
 			}
 		}(projectName, from)
@@ -68,7 +67,6 @@ func ReadWorkspaceLogs(ctx context.Context, activeProfile config.Profile, worksp
 			}
 
 			readJSONLog(ctx, ws, logs_view.STATIC_INDEX, from)
-			ws.Close()
 			break
 		}
 	}
@@ -88,12 +86,13 @@ func ReadBuildLogs(ctx context.Context, activeProfile config.Profile, buildId st
 		}
 
 		readJSONLog(ctx, ws, logs_view.FIRST_PROJECT_INDEX, nil)
-		ws.Close()
 		break
 	}
 }
 
 func readJSONLog(ctx context.Context, ws *websocket.Conn, index int, from *time.Time) {
+	defer ws.Close()
+
 	logEntriesChan := make(chan logs.LogEntry)
 	readErr := make(chan error)
 	go func() {
