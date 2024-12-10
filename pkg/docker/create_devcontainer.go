@@ -94,6 +94,13 @@ func (d *DockerClient) CreateFromDevcontainer(opts CreateDevcontainerOptions) (s
 		return "", "", err
 	}
 
+	if opts.Prebuild {
+		err = d.runInitializeCommand(opts.ProjectDir, config.MergedConfiguration.InitializeCommand, opts.LogWriter, opts.SshClient)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
 	workspaceFolder := config.Workspace.WorkspaceFolder
 	if workspaceFolder == "" {
 		return "", "", errors.New("unable to determine workspace folder from devcontainer configuration")
@@ -141,7 +148,7 @@ func (d *DockerClient) CreateFromDevcontainer(opts CreateDevcontainerOptions) (s
 
 		getComposeFilePath := func(composeFilePath string) (string, error) {
 			if opts.SshClient != nil {
-				composeFilePath = path.Join(opts.ProjectDir, filepath.Dir(opts.BuildConfig.Devcontainer.FilePath), composeFilePath)
+				composeFilePath = path.Join(paths.ProjectTarget, filepath.Dir(opts.BuildConfig.Devcontainer.FilePath), composeFilePath)
 
 				composeFileContent, err := d.getRemoteComposeContent(&opts, paths, socketForwardId, composeFilePath)
 				if err != nil {
@@ -185,12 +192,12 @@ func (d *DockerClient) CreateFromDevcontainer(opts CreateDevcontainerOptions) (s
 			}
 		}
 
-		options, err := cli.NewProjectOptions(composePaths, cli.WithOsEnv, cli.WithDotEnv)
+		options, err := cli.NewProjectOptions(composePaths, cli.WithEnvFiles(), cli.WithOsEnv, cli.WithDotEnv)
 		if err != nil {
 			return "", "", err
 		}
 
-		project, err := cli.ProjectFromOptions(ctx, options)
+		project, err := options.LoadProject(ctx)
 		if err != nil {
 			return "", "", err
 		}
@@ -201,6 +208,11 @@ func (d *DockerClient) CreateFromDevcontainer(opts CreateDevcontainerOptions) (s
 			if service.Build != nil {
 				if strings.HasPrefix(service.Build.Context, opts.ProjectDir) {
 					service.Build.Context = strings.Replace(service.Build.Context, opts.ProjectDir, paths.ProjectTarget, 1)
+				}
+			}
+			for i, v := range service.Volumes {
+				if strings.HasPrefix(v.Source, paths.ProjectTarget) {
+					service.Volumes[i].Source = strings.Replace(v.Source, paths.ProjectTarget, opts.ProjectDir, 1)
 				}
 			}
 		}
@@ -278,11 +290,6 @@ func (d *DockerClient) CreateFromDevcontainer(opts CreateDevcontainerOptions) (s
 
 	if opts.Prebuild {
 		devcontainerCmd = append(devcontainerCmd, "--prebuild")
-	}
-
-	err = d.runInitializeCommand(opts.ProjectDir, config.MergedConfiguration.InitializeCommand, opts.LogWriter, opts.SshClient)
-	if err != nil {
-		return "", "", err
 	}
 
 	output, err := d.execDevcontainerCommand(strings.Join(devcontainerCmd, " "), &opts, paths, paths.ProjectTarget, socketForwardId, true, []mount.Mount{
@@ -390,21 +397,38 @@ func (d *DockerClient) readDevcontainerConfig(opts *CreateDevcontainerOptions, p
 		configEnvOverride = strings.ReplaceAll(configEnvOverride, fmt.Sprintf("${localEnv:%s}", k), v)
 	}
 
-	writeOverrideCmd := []string{"echo", fmt.Sprintf(`'%s'`, configEnvOverride), ">", "/tmp/devcontainer.json", "&&"}
+	if opts.SshClient != nil {
+		res, err := opts.SshClient.WriteFile(string(configEnvOverride), path.Join(paths.OverridesDir, "devcontainer.json"))
+		if err != nil {
+			opts.LogWriter.Write([]byte(fmt.Sprintf("Error writing override compose file: %s\n", string(res))))
+			return "", nil, err
+		}
+	} else {
+		err = os.WriteFile(path.Join(paths.OverridesDir, "devcontainer.json"), []byte(configEnvOverride), 0644)
+		if err != nil {
+			return "", nil, err
+		}
+	}
 
-	devcontainerCmd := append(writeOverrideCmd, []string{
+	devcontainerCmd := append([]string{}, []string{
 		"devcontainer",
 		"read-configuration",
 		"--workspace-folder=" + paths.ProjectTarget,
 		"--config=" + paths.TargetConfigFilePath,
-		"--override-config=/tmp/devcontainer.json",
+		"--override-config=" + path.Join(paths.OverridesTarget, "devcontainer.json"),
 		"--include-merged-configuration",
 		"&&",
 		"sleep",
 		"1",
 	}...)
 
-	output, err := d.execDevcontainerCommand(strings.Join(devcontainerCmd, " "), opts, paths, paths.ProjectTarget, socketForwardId, false, nil)
+	output, err := d.execDevcontainerCommand(strings.Join(devcontainerCmd, " "), opts, paths, paths.ProjectTarget, socketForwardId, false, []mount.Mount{
+		{
+			Type:   mount.TypeBind,
+			Source: paths.OverridesDir,
+			Target: paths.OverridesTarget,
+		},
+	})
 	if err != nil {
 		return "", nil, err
 	}
@@ -581,7 +605,7 @@ func (d *DockerClient) getRemoteComposeContent(opts *CreateDevcontainerOptions, 
 		return "", nil
 	}
 
-	output, err := d.execDevcontainerCommand("docker compose config", opts, paths, filepath.Dir(composePath), socketForwardId, false, nil)
+	output, err := d.execDevcontainerCommand(fmt.Sprintf("docker compose -f %s config", composePath), opts, paths, filepath.Dir(composePath), socketForwardId, false, nil)
 	if err != nil {
 		return "", err
 	}
